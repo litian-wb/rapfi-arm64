@@ -1,10 +1,13 @@
 name: build-rapfi
 
 # 目标：在 GitHub 的免费 ARM64 跑机器人上，把 Rapfi 编成
-#       musl 静态 aarch64 二进制，拷回手机直接运行（零依赖）。
+#       musl aarch64 二进制，拷回手机直接运行。
+# 关键点：musl 的默认线程栈只有 128KB（glibc 是 8MB），Rapfi 的搜索递归
+#         会立刻爆栈段错误。所以用 --wrap=pthread_create 给所有线程
+#         换成 32MB 栈。
 
 on:
-  workflow_dispatch:        # 手动触发
+  workflow_dispatch:
   push:
     branches: [ main ]
 
@@ -19,12 +22,40 @@ jobs:
 
     steps:
       - name: 安装工具链
-        run: |
-          apk add --no-cache build-base cmake ninja git file
+        run: apk add --no-cache build-base cmake ninja git file curl jq
 
-      - name: 拉取 Rapfi 源码（不拉子模块，权重用现成的）
+      - name: 拉取 Rapfi 源码
+        run: git clone --depth 1 https://github.com/dhbloo/rapfi.git /src
+
+      - name: 编译线程栈补丁
         run: |
-          git clone --depth 1 https://github.com/dhbloo/rapfi.git /src
+          cat > /src/pthread_stack.c <<'CEOF'
+          #include <pthread.h>
+          #include <stddef.h>
+
+          #define WANT_STACK (32u * 1024u * 1024u)
+
+          extern int __real_pthread_create(pthread_t *, const pthread_attr_t *,
+                                           void *(*)(void *), void *);
+
+          int __wrap_pthread_create(pthread_t *th, const pthread_attr_t *attr,
+                                    void *(*fn)(void *), void *arg)
+          {
+              pthread_attr_t a;
+              if (attr) {
+                  a = *attr;
+              } else {
+                  pthread_attr_init(&a);
+              }
+              size_t sz = 0;
+              if (pthread_attr_getstacksize(&a, &sz) != 0 || sz < WANT_STACK) {
+                  pthread_attr_setstacksize(&a, WANT_STACK);
+              }
+              return __real_pthread_create(th, &a, fn, arg);
+          }
+          CEOF
+          gcc -O2 -c /src/pthread_stack.c -o /src/pthread_stack.o
+          file /src/pthread_stack.o
 
       - name: 配置
         run: |
@@ -33,10 +64,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DUSE_NEON=ON \
             -DUSE_NEON_DOTPROD=OFF \
-            -DNO_COMMAND_MODULES=ON \
-            -DCMAKE_EXE_LINKER_FLAGS="-static"
+            -DCMAKE_EXE_LINKER_FLAGS="-static -Wl,--wrap=pthread_create /src/pthread_stack.o"
           echo "--- 关键开关 ---"
-          grep -E "USE_NEON|NO_COMMAND_MODULES|NO_MULTI_THREADING" build/CMakeCache.txt || true
+          grep -E "USE_NEON|NO_MULTI_THREADING" build/CMakeCache.txt || true
 
       - name: 编译
         run: cmake --build /src/Rapfi/build -j"$(nproc)"
@@ -48,10 +78,10 @@ jobs:
           echo "产物路径: $BIN"
           ls -la "$BIN"
           file "$BIN"
-          echo "--- 动态依赖 ---"
+          echo "--- 确认补丁已链入（应能找到 __wrap_pthread_create）---"
+          (nm "$BIN" 2>/dev/null | grep -c "pthread_create" || echo "nm 不可用")
           if readelf -d "$BIN" | grep -q NEEDED; then
             readelf -d "$BIN" | grep NEEDED
-            echo "（动态链接；本机是 musl，仍可直接运行）"
           else
             echo "无动态依赖 ✅ 完全静态"
           fi
@@ -63,19 +93,17 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: build-${{ github.run_number }}
         run: |
-          apk add --no-cache curl jq
           REPO="${{ github.repository }}"
           echo "→ 创建 release $TAG"
           REL="$(curl -sS -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            -d "{\"tag_name\":\"$TAG\",\"name\":\"Rapfi aarch64 musl $TAG\"}" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"Rapfi aarch64 $TAG\"}" \
             "https://api.github.com/repos/$REPO/releases")"
           ID="$(echo "$REL" | jq -r '.id')"
           URL="$(echo "$REL" | jq -r '.upload_url' | cut -d'{' -f1)"
           if [ "$ID" = "null" ] || [ -z "$ID" ]; then echo "$REL"; exit 1; fi
           echo "release id = $ID"
-          echo "→ 上传二进制"
           curl -sS -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/octet-stream" \
