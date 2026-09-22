@@ -9,7 +9,7 @@ on:
     branches: [ main ]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -58,9 +58,26 @@ jobs:
           cp "$BIN" /src/pbrain-rapfi
           chmod 755 /src/pbrain-rapfi
 
-      - name: 上传产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: rapfi-aarch64-musl
-          path: /src/pbrain-rapfi
-          if-no-files-found: error
+      - name: 发布到 Release
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: build-${{ github.run_number }}
+        run: |
+          apk add --no-cache curl jq
+          REPO="${{ github.repository }}"
+          echo "→ 创建 release $TAG"
+          REL="$(curl -sS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"Rapfi aarch64 musl $TAG\"}" \
+            "https://api.github.com/repos/$REPO/releases")"
+          ID="$(echo "$REL" | jq -r '.id')"
+          URL="$(echo "$REL" | jq -r '.upload_url' | cut -d'{' -f1)"
+          if [ "$ID" = "null" ] || [ -z "$ID" ]; then echo "$REL"; exit 1; fi
+          echo "release id = $ID"
+          echo "→ 上传二进制"
+          curl -sS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @/src/pbrain-rapfi \
+            "$URL?name=pbrain-rapfi" | jq -r '"下载地址: " + .browser_download_url'
