@@ -33,7 +33,7 @@ jobs:
           #include <pthread.h>
           #include <stddef.h>
 
-          #define WANT_STACK (32u * 1024u * 1024u)
+          #define WANT_STACK (8u * 1024u * 1024u)
 
           extern int __real_pthread_create(pthread_t *, const pthread_attr_t *,
                                            void *(*)(void *), void *);
