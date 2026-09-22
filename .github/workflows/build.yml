@@ -1,0 +1,57 @@
+name: build-rapfi
+
+# 目标：在 GitHub 的免费 ARM64 跑机器人上，把 Rapfi 编成
+#       musl 静态 aarch64 二进制，拷回手机直接运行（零依赖）。
+
+on:
+  workflow_dispatch:        # 手动触发
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 注意：ubuntu-24.04-arm 只对【公开仓库】免费。私有仓库请改成 ubuntu-latest。
+    runs-on: ubuntu-24.04-arm
+    container: alpine:3.20
+
+    steps:
+      - name: 安装工具链
+        run: |
+          apk add --no-cache build-base cmake ninja git file
+
+      - name: 拉取 Rapfi 源码（不拉子模块，权重用现成的）
+        run: |
+          git clone --depth 1 https://github.com/dhbloo/rapfi.git /src
+
+      - name: 配置
+        run: |
+          cd /src/Rapfi
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DUSE_NEON=ON \
+            -DUSE_NEON_DOTPROD=OFF \
+            -DNO_COMMAND_MODULES=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          echo "--- 关键开关 ---"
+          grep -E "USE_NEON|NO_COMMAND_MODULES|NO_MULTI_THREADING" build/CMakeCache.txt || true
+
+      - name: 编译
+        run: cmake --build /src/Rapfi/build -j"$(nproc)"
+
+      - name: 检查产物
+        run: |
+          cd /src/Rapfi/build
+          ls -la rapfi
+          file rapfi
+          echo "--- 动态依赖（应为空，表示静态）---"
+          (readelf -d rapfi | grep NEEDED || echo "无动态依赖 ✅")
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapfi-aarch64-musl
+          path: /src/Rapfi/build/rapfi
+          if-no-files-found: error
