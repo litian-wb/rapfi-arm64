@@ -1,0 +1,128 @@
+name: build-rapfi-dotprod
+
+# 验证题：Apple A12 支不支持 ARMv8.2 点积指令（SDOT/UDOT）？
+#
+# Rapfi 的 NNUE 内层循环就是 8 位点积 —— 和 x86 的 AVX-VNNI (vpdpbusd) 同一件事。
+# 之前的 ARM 构建用的是 -DUSE_NEON_DOTPROD=OFF（保守），如果这颗 CPU 支持 SDOT，
+# 打开它能让 NNUE 求值快 2~4 倍 —— 等于白送一倍多的硬件。
+#
+# /proc/cpuinfo 在 iSH 里是模拟的（CPU part: 0x000，只报 aes/asimd），问不出真相。
+# 所以直接编出来在真机上跑：不支持会立刻 SIGILL，支持就把 nps 提上去。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dotprod:
+    runs-on: ubuntu-24.04-arm
+    container: alpine:3.20
+
+    steps:
+      - name: 安装工具链
+        run: apk add --no-cache build-base cmake ninja git file curl jq
+
+      - name: 拉取源码
+        run: git clone --depth 1 https://github.com/dhbloo/rapfi.git /src
+
+      - name: 线程栈补丁（musl 默认仅 128KB，搜索递归会爆栈）
+        run: |
+          cat > /src/pthread_stack.c <<'CEOF'
+          #include <pthread.h>
+          #include <stddef.h>
+          #define WANT_STACK (8u * 1024u * 1024u)
+          extern int __real_pthread_create(pthread_t *, const pthread_attr_t *,
+                                           void *(*)(void *), void *);
+          int __wrap_pthread_create(pthread_t *th, const pthread_attr_t *attr,
+                                    void *(*fn)(void *), void *arg)
+          {
+              pthread_attr_t a;
+              if (attr) { a = *attr; } else { pthread_attr_init(&a); }
+              size_t sz = 0;
+              if (pthread_attr_getstacksize(&a, &sz) != 0 || sz < WANT_STACK)
+                  pthread_attr_setstacksize(&a, WANT_STACK);
+              return __real_pthread_create(th, &a, fn, arg);
+          }
+          CEOF
+          gcc -O2 -c /src/pthread_stack.c -o /src/pthread_stack.o
+          file /src/pthread_stack.o
+
+      - name: 编译两个变体（开/关点积）
+        run: |
+          build() {
+            name="$1"; dp="$2"
+            echo "########## $name (NEON_DOTPROD=$dp) ##########"
+            cd /src/Rapfi
+            cmake -S . -B "build-$name" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DUSE_NEON=ON -DUSE_NEON_DOTPROD="$dp" \
+              -DCMAKE_EXE_LINKER_FLAGS="-static -Wl,--wrap=pthread_create /src/pthread_stack.o" \
+              || { echo "!! $name 配置失败"; return 1; }
+            cmake --build "build-$name" -j"$(nproc)" || { echo "!! $name 编译失败"; return 1; }
+            BIN="$(find "build-$name" -maxdepth 1 -type f -executable | head -1)"
+            cp "$BIN" "/src/pbrain-rapfi-$name"
+            chmod 755 "/src/pbrain-rapfi-$name"
+            ls -la "/src/pbrain-rapfi-$name"
+          }
+          grep -n 'DOTPROD' CMakeLists.txt | head -5
+          build dotprod ON
+          build nodotprod OFF
+
+      - name: CI 机器上自测（CI 是 Graviton/Ampere，支持点积）
+        run: |
+          cat > /tmp/bench.py <<'EOF'
+          import subprocess, threading, time, sys, re
+          path = sys.argv[1]
+          p = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, bufsize=1)
+          lines = []
+          threading.Thread(target=lambda: [lines.append(l.rstrip()) for l in p.stdout], daemon=True).start()
+          def s(c, w=0.15):
+              p.stdin.write(c + '\n'); p.stdin.flush(); time.sleep(w)
+          for c in ['START 15', 'INFO thread_num 2', 'INFO timeout_turn 3000',
+                    'YXBOARD', 'DONE', 'TURN 7,7']:
+              s(c)
+          t0 = time.time()
+          mv = None
+          while time.time() - t0 < 20:
+              for l in lines:
+                  t = l.strip()
+                  if t and ',' in t and t.replace(',', '').isdigit():
+                      mv = t; break
+              if mv: break
+              time.sleep(0.1)
+          p.kill()
+          speed = [l for l in lines if l.startswith('MESSAGE Speed')]
+          print("  落子 %s" % mv)
+          for l in speed[-1:]:
+              print("  %s" % l)
+          EOF
+          for v in nodotprod dotprod; do
+            echo "--- $v ---"
+            timeout 40 python3 /tmp/bench.py "/src/pbrain-rapfi-$v" || echo "  !! $v 跑不起来"
+          done
+
+      - name: 发布
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: dotprod-${{ github.run_number }}
+        run: |
+          REPO="${{ github.repository }}"
+          REL="$(curl -sS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"Rapfi dotprod $TAG\"}" \
+            "https://api.github.com/repos/$REPO/releases")"
+          ID="$(echo "$REL" | jq -r '.id')"
+          URL="$(echo "$REL" | jq -r '.upload_url' | cut -d'{' -f1)"
+          [ "$ID" = "null" ] && { echo "$REL"; exit 1; }
+          for v in dotprod nodotprod; do
+            curl -sS --retry 3 -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"/src/pbrain-rapfi-$v" \
+              "$URL?name=pbrain-rapfi-$v" \
+              | jq -r '"上传: " + .name + "  " + ((.size/1048576*100|floor)/100|tostring) + " MB"'
+          done
