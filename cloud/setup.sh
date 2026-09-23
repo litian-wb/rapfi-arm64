@@ -2,6 +2,7 @@
 # Rapfi 云端桥接 —— 在 GitHub Codespaces 里一键部署
 # 用法: bash setup.sh
 set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$HOME"
 
 echo "① 安装依赖…"
@@ -28,9 +29,9 @@ cp /tmp/rapfiex/model*.bin "$HOME/rapfi/" 2>/dev/null || true
 
 FLAGS=$(grep -m1 '^flags' /proc/cpuinfo || true)
 PICK="avx2"
-if echo "$FLAGS" | grep -qw avx512vnni;   then PICK="avx512vnni"
+if echo "$FLAGS" | grep -qwE "avx512_vnni|avx512vnni"; then PICK="avx512vnni"
 elif echo "$FLAGS" | grep -qw avx512f;    then PICK="avx512"
-elif echo "$FLAGS" | grep -qw avx_vnni;   then PICK="avxvnni"
+elif echo "$FLAGS" | grep -qwE "avx_vnni|avxvnni"; then PICK="avxvnni"
 elif echo "$FLAGS" | grep -qw avx2;       then PICK="avx2"
 else PICK="sse"; fi
 echo "   CPU 支持 → 选用 $PICK 版本（官方推荐序：avx512vnni > avx512 > avxvnni > avx2 > sse）"
@@ -44,10 +45,8 @@ sed -i "s/^default_thread_num = .*/default_thread_num = $THREADS/" "$HOME/rapfi/
 echo "   检测到 $CORES 核，线程数设为 $THREADS"
 
 echo "⑤ 放置桥接脚本…"
-if [ -f "$HOME/rapfi-arm64/cloud/bridge.py" ]; then
-  cp "$HOME/rapfi-arm64/cloud/bridge.py" "$HOME/rapfi/bridge.py"
-elif [ -f ./bridge.py ]; then
-  cp ./bridge.py "$HOME/rapfi/bridge.py"
+if [ -f "$SCRIPT_DIR/bridge.py" ]; then
+  cp "$SCRIPT_DIR/bridge.py" "$HOME/rapfi/bridge.py"
 else
   echo "   ⚠️ 找不到 bridge.py，请把它和本脚本放一起"
   exit 1
