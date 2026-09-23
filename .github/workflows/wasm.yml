@@ -5,16 +5,17 @@ name: build-rapfi-wasm
 # 上游 CMakeLists 自带 EMSCRIPTEN 分支：
 #   - 导出 _main / _gomocupLoopOnce / _emscripten_force_exit
 #   - emscripten/preamble.js 提供 Module.sendCommand() 同步驱动 + 逐行 stdout 回调
-#   - -s MODULARIZE=1，导出名 Rapfi
+#   - 单线程构建下 gomocupLoop() 直接 return，由 JS 逐条调 gomocupLoopOnce()
 #
 # 本流程改动：
 #   --closure=1 去掉   → 保留可读 JS，方便自己接前端
-#   STACK_SIZE 2MB→8MB → 本机实测 Rhpfi 搜索递归吃栈（musl 128KB 直接爆）
+#   STACK_SIZE 2MB→8MB → 本机实测 Rapfi 搜索递归吃栈（musl 128KB 直接爆）
 #   权重按需裁剪       → 只带 gomoku 用得上的 freestyle 网络
 #
-# 产出两个版本：
-#   main = mix9svq freestyle 权重（强，约 11MB）
-#   lite = 经典小模型（弱一些，约 1.5MB，秒开）
+# 实测：测试机 WebView（iOS 18.0）的 WASM 不支持任何 SIMD，故编多个变体：
+#   nosimd = 纯 MVP 指令集，兼容性最好，慢
+#   simd   = 基础 WASM SIMD（Safari 16.4+ 应有）
+#   relaxed = SIMD + 松弛点积（Safari 18.4+，最快）
 
 on:
   workflow_dispatch:
@@ -49,14 +50,11 @@ jobs:
       - name: 生成裁剪版配置（只保留 freestyle 权重）
         run: |
           cd /src/Networks/config-example
-          # 每个权重条目是「[[model.evaluator.weights]] + weight_file 行」两行，
-          # N 把下一行读进模式空间，命中名字就一起删掉
           sed -e '/^\[\[model\.evaluator\.weights\]\]$/{N;/mix9svqstandard_bs15\|mix9svqrenju/d}' \
               gomocalc-mix9svq.toml > wasm-main.toml
-          echo "--- 裁剪后仍含混合权重条目的行 ---"
           grep -n 'weight_file\|weights\]\]' wasm-main.toml
 
-      - name: 写预载清单 · main（freestyle 版）
+      - name: 写预载清单
         run: |
           printf '%s\n' \
             'config-example/wasm-main.toml@config.toml' \
@@ -64,39 +62,34 @@ jobs:
             'mix9svq/mix9svqfreestyle_bsmix.bin.lz4@/mix9svqfreestyle_bsmix.bin.lz4' \
             > /src/Networks/wasm_preloads.txt
           cat /src/Networks/wasm_preloads.txt
-          cd /src/Rapfi
-          emcmake cmake -S . -B build-main -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DNO_COMMAND_MODULES=ON -DNO_MULTI_THREADING=ON \
-            -DUSE_WASM_SIMD=ON -DUSE_WASM_SIMD_RELAXED=ON
-          cmake --build build-main -j"$(nproc)"
-          echo "--- main 产物 ---"
-          ls -lh build-main/ | grep rapfi
 
-      - name: 编译 · lite（经典小模型，秒开）
+      - name: 编译三个变体
         run: |
-          printf '%s\n' \
-            'config-example/gomocalc-classical220723.toml@config.toml' \
-            'classical@/' \
-            > /src/Networks/wasm_preloads.txt
-          cat /src/Networks/wasm_preloads.txt
           cd /src/Rapfi
-          emcmake cmake -S . -B build-lite -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DNO_COMMAND_MODULES=ON -DNO_MULTI_THREADING=ON \
-            -DUSE_WASM_SIMD=ON -DUSE_WASM_SIMD_RELAXED=ON
-          cmake --build build-lite -j"$(nproc)"
-          echo "--- lite 产物 ---"
-          ls -lh build-lite/ | grep rapfi
+          build() {
+            name="$1"; simd="$2"; relaxed="$3"
+            echo "########## $name (SIMD=$simd RELAXED=$relaxed) ##########"
+            emcmake cmake -S . -B "build-$name" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DNO_COMMAND_MODULES=ON -DNO_MULTI_THREADING=ON \
+              -DUSE_WASM_SIMD="$simd" -DUSE_WASM_SIMD_RELAXED="$relaxed" \
+              || { echo "!! $name 配置失败"; return 1; }
+            cmake --build "build-$name" -j"$(nproc)" \
+              || { echo "!! $name 编译失败"; return 1; }
+            ls -lh "build-$name/" | grep rapfi
+          }
+          build nosimd OFF OFF || true
+          build simd   ON  OFF || true
+          build relaxed ON ON  || true
 
       - name: 打包并发布
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: wasm-${{ github.run_number }}
         run: |
-          for f in main lite; do
-            cd /src/Rapfi/build-$f
-            tar czf /tmp/rapfi-wasm-$f.tar.gz $(ls | grep -E '^rapfi')
+          for f in nosimd simd relaxed; do
+            cd /src/Rapfi/build-$f || continue
+            tar czf /tmp/rapfi-wasm-$f.tar.gz $(ls | grep -E '^rapfi') 2>/dev/null || true
           done
           ls -lh /tmp/rapfi-wasm-*.tar.gz
 
@@ -110,8 +103,8 @@ jobs:
           URL="$(echo "$REL" | jq -r '.upload_url' | cut -d'{' -f1)"
           [ "$ID" = "null" ] && { echo "$REL"; exit 1; }
           echo "release id = $ID"
-          echo "TAG=$TAG" > /tmp/tag.env
-          for f in main lite; do
+          for f in nosimd simd relaxed; do
+            [ -f /tmp/rapfi-wasm-$f.tar.gz ] || continue
             curl -sS --retry 3 -X POST \
               -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/gzip" \
@@ -120,12 +113,11 @@ jobs:
               | jq -r '"上传: " + .name + "  " + ((.size/1048576*100|floor)/100|tostring) + " MB"'
           done
 
-      # 放在最后：即使测试失败，上面的产物也已发布，我自己能下载排查
+      # 放在最后：即使测试失败，上面的产物也已发布，我能自己下载排查
       - name: 冒烟测试（node 里真跑一次搜索）
         run: |
           cat > /tmp/smoke.js <<'EOF'
-          const JS = process.argv[2];
-          const Rapfi = require(JS);
+          const Rapfi = require(process.argv[2]);
           const out = [];
           Rapfi({
             onReceiveStdout: (l) => out.push(l),
@@ -142,9 +134,10 @@ jobs:
             console.log("PASS: 引擎落子在 " + move.join(" / "));
           }).catch(e => { console.log("FAIL: " + e); process.exit(1); });
           EOF
-          for f in main lite; do
+          for f in nosimd simd relaxed; do
+            [ -d /src/Rapfi/build-$f ] || continue
             echo "########## $f ##########"
-            JS="$(ls /src/Rapfi/build-$f/rapfi-*.js | head -1)"
-            echo "加载 $JS"
-            node /tmp/smoke.js "$JS" || echo "!! $f 冒烟测试失败"
+            cd /src/Rapfi/build-$f
+            JS="$(ls rapfi-*.js | head -1)"
+            node /tmp/smoke.js "/src/Rapfi/build-$f/$JS" || echo "!! $f 冒烟测试失败"
           done
