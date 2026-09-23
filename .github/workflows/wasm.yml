@@ -1,0 +1,130 @@
+name: build-rapfi-wasm
+
+# 目标：把 Rapfi 编成 WebAssembly，塞进静态网页。
+# 关键发现：上游 CMakeLists 有一等公民的 EMSCRIPTEN 分支——
+#   导出 _main / _gomocupLoopOnce / _emscripten_force_exit
+#   preamble.js 提供 Module.sendCommand() 同步驱动 + 逐行 stdout 回调
+#   -s MODULARIZE=1，导出名 Rapfi
+# 所以交互层不用自己写，只要把编译开关配好。
+#
+# 改动说明：
+#   --closure=1 去掉 → 保留可读 JS，方便我们自己接前端
+#   STACK_SIZE 2MB → 8MB → 本机实测 Rapfi 搜索递归很吃栈（musl 128KB 直接爆）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    container: emscripten/emsdk:latest
+
+    steps:
+      - name: 安装依赖
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq cmake ninja-build git file jq curl
+
+      - name: 拉取源码与权重仓库
+        run: |
+          git clone --depth 1 https://github.com/dhbloo/rapfi.git /src
+          git clone --depth 1 https://github.com/dhbloo/rapfi-networks.git /src/Networks
+          echo "--- 权重仓库内容 ---"
+          ls /src/Networks
+          echo "--- wasm_preloads.txt ---"
+          cat /src/Networks/wasm_preloads.txt
+
+      - name: 打补丁
+        run: |
+          cd /src/Rapfi
+          sed -i 's/--closure=1 //' CMakeLists.txt
+          sed -i 's/-s STACK_SIZE=2MB/-s STACK_SIZE=8MB/' CMakeLists.txt
+          echo "--- 确认补丁 ---"
+          grep -n 'closure\|STACK_SIZE' CMakeLists.txt
+
+      - name: 编译 · 完整版（含 mix9svq 神经网络）
+        run: |
+          cd /src/Rapfi
+          emcmake cmake -S . -B build-full -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNO_COMMAND_MODULES=ON \
+            -DNO_MULTI_THREADING=ON \
+            -DUSE_WASM_SIMD=ON \
+            -DUSE_WASM_SIMD_RELAXED=ON
+          cmake --build build-full -j"$(nproc)"
+          echo "--- 产物 ---"
+          ls -lh build-full/ | grep -E 'rapfi|total'
+
+      - name: 编译 · 精简版（仅经典小模型）
+        run: |
+          cd /src/Networks
+          sed -i '/^mix9svq@\/$/d' wasm_preloads.txt
+          sed -i 's|gomocalc-mix9svq\.toml@config.toml|gomocalc-classical220723.toml@config.toml|' wasm_preloads.txt
+          echo "--- 精简版预载清单 ---"
+          cat wasm_preloads.txt
+          cd /src/Rapfi
+          emcmake cmake -S . -B build-lite -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNO_COMMAND_MODULES=ON \
+            -DNO_MULTI_THREADING=ON \
+            -DUSE_WASM_SIMD=ON \
+            -DUSE_WASM_SIMD_RELAXED=ON
+          cmake --build build-lite -j"$(nproc)"
+          ls -lh build-lite/ | grep -E 'rapfi|total'
+
+      - name: 冒烟测试（在 node 里真跑一次搜索）
+        continue-on-error: true
+        run: |
+          cd /src/Rapfi/build-lite
+          JS="$(ls | grep -E '^rapfi.*\.js$' | head -1)"
+          echo "加载 $JS"
+          cat > /tmp/smoke.js <<'EOF'
+          const path = process.argv[2];
+          const Rapfi = require(path);
+          const out = [];
+          Rapfi({
+            onReceiveStdout: (l) => { out.push(l); console.log("OUT|" + l); },
+            onReceiveStderr: (l) => console.log("ERR|" + l),
+          }).then((M) => {
+            Module_send(M, "START 15");
+            Module_send(M, "INFO timeout_turn 2000");
+            Module_send(M, "YXBOARD 7,7,1");
+            Module_send(M, "BEGIN");
+            console.log("=== 共收到 " + out.length + " 行输出 ===");
+            console.log(out.join("\n"));
+          }).catch(e => { console.log("FAIL|" + e); });
+          function Module_send(M, c) { console.log("CMD|" + c); M.sendCommand(c); }
+          EOF
+          node /tmp/smoke.js "./$JS" 2>&1 | tail -40
+
+      - name: 打包
+        run: |
+          cd /src/Rapfi/build-full && tar czf /tmp/rapfi-wasm-full.tar.gz $(ls | grep -E '^rapfi')
+          cd /src/Rapfi/build-lite && tar czf /tmp/rapfi-wasm-lite.tar.gz $(ls | grep -E '^rapfi')
+          ls -lh /tmp/rapfi-wasm-*.tar.gz
+
+      - name: 发布到 Release
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: wasm-${{ github.run_number }}
+        run: |
+          REPO="${{ github.repository }}"
+          REL="$(curl -sS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"Rapfi WASM $TAG\"}" \
+            "https://api.github.com/repos/$REPO/releases")"
+          ID="$(echo "$REL" | jq -r '.id')"
+          URL="$(echo "$REL" | jq -r '.upload_url' | cut -d'{' -f1)"
+          if [ "$ID" = "null" ] || [ -z "$ID" ]; then echo "$REL"; exit 1; fi
+          echo "release id = $ID"
+          for f in full lite; do
+            curl -sS --retry 3 -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/gzip" \
+              --data-binary @/tmp/rapfi-wasm-$f.tar.gz \
+              "$URL?name=rapfi-wasm-$f.tar.gz" | jq -r '"上传: " + .name + "  " + (.size|tostring) + " 字节"'
+          done
