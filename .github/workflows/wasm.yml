@@ -1,15 +1,20 @@
 name: build-rapfi-wasm
 
-# 目标：把 Rapfi 编成 WebAssembly，塞进静态网页。
-# 关键发现：上游 CMakeLists 有一等公民的 EMSCRIPTEN 分支——
-#   导出 _main / _gomocupLoopOnce / _emscripten_force_exit
-#   preamble.js 提供 Module.sendCommand() 同步驱动 + 逐行 stdout 回调
-#   -s MODULARIZE=1，导出名 Rapfi
-# 所以交互层不用自己写，只要把编译开关配好。
+# 把 Rapfi 编成 WebAssembly，塞进静态网页（GitHub Pages 可托管）。
 #
-# 改动说明：
-#   --closure=1 去掉 → 保留可读 JS，方便我们自己接前端
-#   STACK_SIZE 2MB → 8MB → 本机实测 Rapfi 搜索递归很吃栈（musl 128KB 直接爆）
+# 上游 CMakeLists 自带 EMSCRIPTEN 分支：
+#   - 导出 _main / _gomocupLoopOnce / _emscripten_force_exit
+#   - emscripten/preamble.js 提供 Module.sendCommand() 同步驱动 + 逐行 stdout 回调
+#   - -s MODULARIZE=1，导出名 Rapfi
+#
+# 本流程改动：
+#   --closure=1 去掉   → 保留可读 JS，方便自己接前端
+#   STACK_SIZE 2MB→8MB → 本机实测 Rhpfi 搜索递归吃栈（musl 128KB 直接爆）
+#   权重按需裁剪       → 只带 gomoku 用得上的 freestyle 网络
+#
+# 产出两个版本：
+#   main = mix9svq freestyle 权重（强，约 11MB）
+#   lite = 经典小模型（弱一些，约 1.5MB，秒开）
 
 on:
   workflow_dispatch:
@@ -32,85 +37,69 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/dhbloo/rapfi.git /src
           git clone --depth 1 https://github.com/dhbloo/rapfi-networks.git /src/Networks
-          echo "--- 权重仓库内容 ---"
           ls /src/Networks
-          echo "--- wasm_preloads.txt ---"
-          cat /src/Networks/wasm_preloads.txt
 
       - name: 打补丁
         run: |
           cd /src/Rapfi
           sed -i 's/--closure=1 //' CMakeLists.txt
           sed -i 's/-s STACK_SIZE=2MB/-s STACK_SIZE=8MB/' CMakeLists.txt
-          echo "--- 确认补丁 ---"
           grep -n 'closure\|STACK_SIZE' CMakeLists.txt
 
-      - name: 编译 · 完整版（含 mix9svq 神经网络）
+      - name: 生成裁剪版配置（只保留 freestyle 权重）
         run: |
-          cd /src/Rapfi
-          emcmake cmake -S . -B build-full -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DNO_COMMAND_MODULES=ON \
-            -DNO_MULTI_THREADING=ON \
-            -DUSE_WASM_SIMD=ON \
-            -DUSE_WASM_SIMD_RELAXED=ON
-          cmake --build build-full -j"$(nproc)"
-          echo "--- 产物 ---"
-          ls -lh build-full/ | grep -E 'rapfi|total'
+          cd /src/Networks/config-example
+          # 每个权重条目是「[[model.evaluator.weights]] + weight_file 行」两行，
+          # N 把下一行读进模式空间，命中名字就一起删掉
+          sed -e '/^\[\[model\.evaluator\.weights\]\]$/{N;/mix9svqstandard_bs15\|mix9svqrenju/d}' \
+              gomocalc-mix9svq.toml > wasm-main.toml
+          echo "--- 裁剪后仍含混合权重条目的行 ---"
+          grep -n 'weight_file\|weights\]\]' wasm-main.toml
 
-      - name: 编译 · 精简版（仅经典小模型）
+      - name: 写预载清单 · main（freestyle 版）
         run: |
-          cd /src/Networks
-          sed -i '/^mix9svq@\/$/d' wasm_preloads.txt
-          sed -i 's|gomocalc-mix9svq\.toml@config.toml|gomocalc-classical220723.toml@config.toml|' wasm_preloads.txt
-          echo "--- 精简版预载清单 ---"
-          cat wasm_preloads.txt
+          printf '%s\n' \
+            'config-example/wasm-main.toml@config.toml' \
+            'classical@/' \
+            'mix9svq/mix9svqfreestyle_bsmix.bin.lz4@/mix9svqfreestyle_bsmix.bin.lz4' \
+            > /src/Networks/wasm_preloads.txt
+          cat /src/Networks/wasm_preloads.txt
+          cd /src/Rapfi
+          emcmake cmake -S . -B build-main -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNO_COMMAND_MODULES=ON -DNO_MULTI_THREADING=ON \
+            -DUSE_WASM_SIMD=ON -DUSE_WASM_SIMD_RELAXED=ON
+          cmake --build build-main -j"$(nproc)"
+          echo "--- main 产物 ---"
+          ls -lh build-main/ | grep rapfi
+
+      - name: 编译 · lite（经典小模型，秒开）
+        run: |
+          printf '%s\n' \
+            'config-example/gomocalc-classical220723.toml@config.toml' \
+            'classical@/' \
+            > /src/Networks/wasm_preloads.txt
+          cat /src/Networks/wasm_preloads.txt
           cd /src/Rapfi
           emcmake cmake -S . -B build-lite -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DNO_COMMAND_MODULES=ON \
-            -DNO_MULTI_THREADING=ON \
-            -DUSE_WASM_SIMD=ON \
-            -DUSE_WASM_SIMD_RELAXED=ON
+            -DNO_COMMAND_MODULES=ON -DNO_MULTI_THREADING=ON \
+            -DUSE_WASM_SIMD=ON -DUSE_WASM_SIMD_RELAXED=ON
           cmake --build build-lite -j"$(nproc)"
-          ls -lh build-lite/ | grep -E 'rapfi|total'
+          echo "--- lite 产物 ---"
+          ls -lh build-lite/ | grep rapfi
 
-      - name: 冒烟测试（在 node 里真跑一次搜索）
-        continue-on-error: true
-        run: |
-          cd /src/Rapfi/build-lite
-          JS="$(ls | grep -E '^rapfi.*\.js$' | head -1)"
-          echo "加载 $JS"
-          cat > /tmp/smoke.js <<'EOF'
-          const path = process.argv[2];
-          const Rapfi = require(path);
-          const out = [];
-          Rapfi({
-            onReceiveStdout: (l) => { out.push(l); console.log("OUT|" + l); },
-            onReceiveStderr: (l) => console.log("ERR|" + l),
-          }).then((M) => {
-            Module_send(M, "START 15");
-            Module_send(M, "INFO timeout_turn 2000");
-            Module_send(M, "YXBOARD 7,7,1");
-            Module_send(M, "BEGIN");
-            console.log("=== 共收到 " + out.length + " 行输出 ===");
-            console.log(out.join("\n"));
-          }).catch(e => { console.log("FAIL|" + e); });
-          function Module_send(M, c) { console.log("CMD|" + c); M.sendCommand(c); }
-          EOF
-          node /tmp/smoke.js "./$JS" 2>&1 | tail -40
-
-      - name: 打包
-        run: |
-          cd /src/Rapfi/build-full && tar czf /tmp/rapfi-wasm-full.tar.gz $(ls | grep -E '^rapfi')
-          cd /src/Rapfi/build-lite && tar czf /tmp/rapfi-wasm-lite.tar.gz $(ls | grep -E '^rapfi')
-          ls -lh /tmp/rapfi-wasm-*.tar.gz
-
-      - name: 发布到 Release
+      - name: 打包并发布
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: wasm-${{ github.run_number }}
         run: |
+          for f in main lite; do
+            cd /src/Rapfi/build-$f
+            tar czf /tmp/rapfi-wasm-$f.tar.gz $(ls | grep -E '^rapfi')
+          done
+          ls -lh /tmp/rapfi-wasm-*.tar.gz
+
           REPO="${{ github.repository }}"
           REL="$(curl -sS -X POST \
             -H "Authorization: Bearer $TOKEN" \
@@ -119,12 +108,43 @@ jobs:
             "https://api.github.com/repos/$REPO/releases")"
           ID="$(echo "$REL" | jq -r '.id')"
           URL="$(echo "$REL" | jq -r '.upload_url' | cut -d'{' -f1)"
-          if [ "$ID" = "null" ] || [ -z "$ID" ]; then echo "$REL"; exit 1; fi
+          [ "$ID" = "null" ] && { echo "$REL"; exit 1; }
           echo "release id = $ID"
-          for f in full lite; do
+          echo "TAG=$TAG" > /tmp/tag.env
+          for f in main lite; do
             curl -sS --retry 3 -X POST \
               -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/gzip" \
               --data-binary @/tmp/rapfi-wasm-$f.tar.gz \
-              "$URL?name=rapfi-wasm-$f.tar.gz" | jq -r '"上传: " + .name + "  " + (.size|tostring) + " 字节"'
+              "$URL?name=rapfi-wasm-$f.tar.gz" \
+              | jq -r '"上传: " + .name + "  " + ((.size/1048576*100|floor)/100|tostring) + " MB"'
+          done
+
+      # 放在最后：即使测试失败，上面的产物也已发布，我自己能下载排查
+      - name: 冒烟测试（node 里真跑一次搜索）
+        run: |
+          cat > /tmp/smoke.js <<'EOF'
+          const JS = process.argv[2];
+          const Rapfi = require(JS);
+          const out = [];
+          Rapfi({
+            onReceiveStdout: (l) => out.push(l),
+            onReceiveStderr: (l) => out.push("[stderr] " + l),
+          }).then((M) => {
+            for (const c of ["START 15", "INFO timeout_turn 2000", "YXBOARD 7,7,1", "BEGIN"]) {
+              console.log("> " + c);
+              M.sendCommand(c);
+            }
+            console.log("=== 引擎输出 " + out.length + " 行 ===");
+            for (const l of out) console.log("  | " + l);
+            const move = out.filter(l => /^\d+,\d+$/.test(l.trim()));
+            if (move.length === 0) { console.log("FAIL: 没解析到落子"); process.exit(1); }
+            console.log("PASS: 引擎落子在 " + move.join(" / "));
+          }).catch(e => { console.log("FAIL: " + e); process.exit(1); });
+          EOF
+          for f in main lite; do
+            echo "########## $f ##########"
+            JS="$(ls /src/Rapfi/build-$f/rapfi-*.js | head -1)"
+            echo "加载 $JS"
+            node /tmp/smoke.js "$JS" || echo "!! $f 冒烟测试失败"
           done
