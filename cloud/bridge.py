@@ -34,7 +34,22 @@ ENGINE = os.path.join(HERE, 'pbrain-rapfi')
 PORT = 8766
 MOVE_RE = re.compile(r'^(\d+),(\d+)$')
 INFO_RE = re.compile(r'Depth (\S+) \| Eval (\S+) \| Node (\S+) \| Time (\S+)')
-SPEED_RE = re.compile(r'Speed (\d+)')
+SPEED_RE = re.compile(r'Speed ([\d.]+)\s*([KMB]?)')
+
+
+def scale_num(v, suf=''):
+    """把引擎的缩写数字还原成实际值。
+
+    官方发行的引擎印 "18K" / "Speed 874K" 这种带后缀的格式，
+    而我们为手机自编译的版本印纯数字。两种都要能认，否则切换
+    云端/本机时速度显示会差 1000 倍。
+    """
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    mul = {'': 1, 'K': 1e3, 'M': 1e6, 'B': 1e9}.get(str(suf or '').upper(), 1)
+    return int(n * mul)
 DEPTH_LINE = re.compile(r'Depth (\S+) \| Eval (-?\S+) \| Time (\S+)')
 # 单步等待上限**必须由档位推导**，不能写死。
 # 踩过的坑：曾把这里固定成 5 秒想"少等一会儿"，结果「最强+ 6 秒」档
@@ -100,10 +115,17 @@ def parse_info(lines, eng_role=1):
     for line in lines:
         m = INFO_RE.search(line)
         if m:
-            info['depth'], info['eval'], info['nodes'], info['ms'] = m.groups()
+            info['depth'], info['eval'], _nodes_raw, info['ms'] = m.groups()
+            _nm = re.match(r'([\d.]+)\s*([KMB]?)', str(_nodes_raw or ''))
+            if _nm:
+                _n = scale_num(_nm.group(1), _nm.group(2))
+                if _n is not None:
+                    info['nodes'] = _n
+            if 'nodes' not in info:
+                info['nodes'] = _nodes_raw
         s = SPEED_RE.search(line)
         if s:
-            info['nps'] = int(s.group(1))
+            info['nps'] = scale_num(s.group(1), s.group(2))
 
     raw = info.get('eval')
     if raw is not None:
