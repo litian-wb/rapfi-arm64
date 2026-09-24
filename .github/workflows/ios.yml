@@ -63,7 +63,11 @@ jobs:
       - name: 找到并检查产物
         run: |
           cd Rapfi
-          BIN=$(find build-ios -type f -name 'rapfi*' -perm +111 | head -1)
+          # macOS 的 find 不支持 -perm +111，改用简单匹配
+          BIN=$(find build-ios -type f -name 'rapfi' | head -1)
+          [ -z "$BIN" ] && BIN=$(find build-ios -type f -name 'pbrain-rapfi' | head -1)
+          [ -z "$BIN" ] && BIN=$(find build-ios -type f -perm -u+x -not -name '*.cmake' -not -name '*.txt' -not -name '*.o' -not -name '*.a' | head -1)
+          echo "全部候选:"; find build-ios -type f -perm -u+x | head -10
           echo "产物: $BIN"
           file "$BIN" || true
           ls -la "$BIN"
