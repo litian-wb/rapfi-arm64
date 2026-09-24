@@ -1,0 +1,85 @@
+name: build-ios
+
+# 为越狱设备编译 iOS 原生 arm64 可执行文件（绕开 iSH 的 6~18 倍减速）
+#
+# 关键注意点（都是踩过的坑）：
+#   1. A12 缺 DotProd 指令 → 必须 USE_NEON_DOTPROD=OFF（曾导致非法指令崩溃）
+#   2. iOS 不是 macOS：必须用 iphoneos SDK + 指定 target triple
+#   3. 目标是「命令行可执行文件」而不是 .app，越狱设备用 ldid 签名即可运行
+#   4. macos-14 runner 本身就是 arm64 → 原生交叉编译，快
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths: [ '.github/workflows/ios.yml' ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: 检出 Rapfi 源码
+        uses: actions/checkout@v4
+        with:
+          repository: dhbloo/rapfi
+          submodules: recursive
+
+      - name: 确认工具链
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: 写 iOS 工具链文件
+        run: |
+          cat > /tmp/ios.toolchain.cmake <<'EOF'
+          set(CMAKE_SYSTEM_NAME Darwin)
+          set(CMAKE_SYSTEM_PROCESSOR arm64)
+          set(CMAKE_OSX_SYSROOT iphoneos)
+          set(CMAKE_OSX_ARCHITECTURES arm64)
+          set(CMAKE_OSX_DEPLOYMENT_TARGET 15.0)
+          set(CMAKE_C_COMPILER   /usr/bin/clang)
+          set(CMAKE_CXX_COMPILER /usr/bin/clang++)
+          EOF
+
+      - name: 配置（关掉 DotProd！）
+        run: |
+          cd Rapfi
+          cmake -B build-ios \
+            -DCMAKE_TOOLCHAIN_FILE=/tmp/ios.toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DUSE_NEON=ON \
+            -DUSE_NEON_DOTPROD=OFF \
+            -DNO_COMMAND_MODULES=ON \
+            -DCMAKE_CXX_FLAGS="-O3 -pthread -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0" \
+            -DCMAKE_C_FLAGS="-O3 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0" \
+            -DCMAKE_EXE_LINKER_FLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0"
+
+      - name: 编译（只编主程序）
+        run: |
+          cd Rapfi
+          cmake --build build-ios --target rapfi -j 4 2>&1 | tail -40
+
+      - name: 找到并检查产物
+        run: |
+          cd Rapfi
+          BIN=$(find build-ios -type f -name 'rapfi*' -perm +111 | head -1)
+          echo "产物: $BIN"
+          file "$BIN" || true
+          ls -la "$BIN"
+          # 确认是 arm64 Mach-O
+          file "$BIN" | grep -q arm64 && echo "✅ ARM64 Mach-O 确认" || echo "⚠️ 架构不对"
+          cp "$BIN" /tmp/pbrain-rapfi-ios
+          ls -la /tmp/pbrain-rapfi-ios
+
+      - name: 打签名（越狱可直接用 ldid，这里先用 ad-hoc 签名保证可执行）
+        run: |
+          codesign -s - --force /tmp/pbrain-rapfi-ios || echo "ad-hoc 签名失败（越狱上用 ldid 也行）"
+          file /tmp/pbrain-rapfi-ios
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: pbrain-rapfi-ios
+          path: /tmp/pbrain-rapfi-ios
+          if-no-files-found: error
