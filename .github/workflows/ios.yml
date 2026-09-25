@@ -51,9 +51,9 @@ jobs:
             -DUSE_NEON=ON \
             -DUSE_NEON_DOTPROD=OFF \
             -DNO_COMMAND_MODULES=ON \
-            -DCMAKE_CXX_FLAGS="-O3 -pthread -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0 -mcpu=apple-a12 -flto -fno-rtti" \
-            -DCMAKE_C_FLAGS="-O3 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0 -mcpu=apple-a12 -flto -fno-rtti" \
-            -DCMAKE_EXE_LINKER_FLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0 -flto"
+            -DCMAKE_CXX_FLAGS="-O3 -pthread -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0 -mcpu=apple-a12" \
+            -DCMAKE_C_FLAGS="-O3 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0 -mcpu=apple-a12" \
+            -DCMAKE_EXE_LINKER_FLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -target arm64-apple-ios15.0"
 
       - name: 编译（只编主程序）
         run: |
